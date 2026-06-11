@@ -1,0 +1,6 @@
+{
+  "name": "RealEstatePriceFinder",
+  "description": "Strumento per la stima dei prezzi medi al metro quadro del mercato immobiliare filtrati per stato di conservazione.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
