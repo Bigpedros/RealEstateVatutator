@@ -1,0 +1,14 @@
+{
+  "background_color": "#8284ab",
+  "dir": "ltr",
+  "display": "standalone",
+  "name": "realestatepricefinder-909091783536.us-east1.run",
+  "orientation": "any",
+  "scope": "/",
+  "short_name": "realestatepricefinder-909091783536.us-east1.run",
+  "start_url": "/https://realestatepricefinder-909091783536.us-east1.run.app/",
+  "theme_color": "#fffff0",
+  "description": "Questa app da una simulazione di una valutazione immobiliare da i parametri che l'utente inserirà per descrivere al meglio possibile l'immoibbile oggetto di valutazione",
+  "id": "realestatepricefinder-909091783536.us-east1.run",
+  "lang": "it"
+}
