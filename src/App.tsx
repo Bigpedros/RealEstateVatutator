@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Search, 
   MapPin, 
@@ -21,8 +21,8 @@ import {
   X
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { PropertyCondition, SearchResult, FloorOption, ExposureOption, AccessoriesInput, PropertyTaglio } from './types';
-import { CONDITIONS, PRESETS_ZONES, calculatePricesForZone, FLOORS, EXPOSURES, TAGLI } from './utils/pricingEngine';
+import { PropertyCondition, SearchResult, FloorOption, ExposureOption, AccessoriesInput, PropertyTaglio, CsvRow } from './types';
+import { CONDITIONS, PRESETS_ZONES, calculatePricesForZone as originalCalculatePricesForZone, FLOORS, EXPOSURES, TAGLI } from './utils/pricingEngine';
 import StatsDashboard from './components/StatsDashboard';
 
 interface HistoryItem {
@@ -50,6 +50,204 @@ export default function App() {
   const [searchHistory, setSearchHistory] = useState<HistoryItem[]>([]);
   const [isHistoryOpen, setIsHistoryOpen] = useState<boolean>(false);
   const [showSuggestions, setShowSuggestions] = useState<boolean>(false);
+
+  const [csvRows, setCsvRows] = useState<CsvRow[] | null>(null);
+  const [csvFileName, setCsvFileName] = useState<string>('');
+  const [csvError, setCsvError] = useState<string>('');
+  const [csvSuccessMessage, setCsvSuccessMessage] = useState<string>('');
+  const [isDragging, setIsDragging] = useState<boolean>(false);
+
+  // Wrapper for calculatePricesForZone that delegates parameters and automatically adds csvRows from state
+  const calculatePricesForZone = (
+    term: string,
+    cond: PropertyCondition,
+    size: number,
+    floor: FloorOption = selectedFloor,
+    exposure: ExposureOption = selectedExposure,
+    accs: AccessoriesInput = accessories,
+    taglio: PropertyTaglio = selectedTaglio
+  ) => {
+    return originalCalculatePricesForZone(term, cond, size, floor, exposure, accs, taglio, csvRows);
+  };
+
+  const handleCsvFileUpload = (file: File) => {
+    setCsvError('');
+    setCsvSuccessMessage('');
+    
+    if (!file) return;
+    
+    if (!file.name.endsWith('.csv')) {
+      setCsvError('Errore: Seleziona un file in formato .csv');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = e.target?.result as string;
+      if (!text) {
+        setCsvError('Errore durante la lettura del file.');
+        return;
+      }
+
+      try {
+        const rawLines = text.split(/\r?\n/).filter(line => line.trim().length > 0);
+        if (rawLines.length < 2) {
+          setCsvError('Errore: Il file CSV è vuoto o contiene solo l\'intestazione.');
+          return;
+        }
+
+        const firstLine = rawLines[0];
+        const commaCount = (firstLine.match(/,/g) || []).length;
+        const semiCount = (firstLine.match(/;/g) || []).length;
+        const separator = semiCount > commaCount ? ';' : ',';
+
+        const parseLine = (line: string): string[] => {
+          const result: string[] = [];
+          let current = '';
+          let inQuotes = false;
+          
+          for (let i = 0; i < line.length; i++) {
+            const char = line[i];
+            if (char === '"' || char === "'") {
+              inQuotes = !inQuotes;
+            } else if (char === separator && !inQuotes) {
+              result.push(current.trim());
+              current = '';
+            } else {
+              current += char;
+            }
+          }
+          result.push(current.trim());
+          return result;
+        };
+
+        const rawHeaders = parseLine(rawLines[0]);
+        
+        const headerMap: { [key: string]: number } = {};
+        rawHeaders.forEach((rawHead, idx) => {
+          const head = rawHead.trim().toLowerCase().replace(/_/g, ' ').replace(/"/g, '').replace(/'/g, '');
+          
+          if (head === 'zona') headerMap['zona'] = idx;
+          else if (head === 'tipologia') headerMap['tipologia'] = idx;
+          else if (head === 'stato conservazione' || head === 'stato_conservazione' || head.includes('conservazione') || head.includes('stato')) headerMap['statoConservazione'] = idx;
+          else if (head === 'prezzo min mq' || head === 'prezzo_min_mq' || head.includes('prezzo min') || head.includes('min_mq') || head === 'prezzo_min') headerMap['prezzoMin'] = idx;
+          else if (head === 'prezzo max mq' || head === 'prezzo_max_mq' || head.includes('prezzo max') || head.includes('max_mq') || head === 'prezzo_max') headerMap['prezzoMax'] = idx;
+          else if (head === 'comune') headerMap['comune'] = idx;
+        });
+
+        const requiredFields = ['zona', 'tipologia', 'statoConservazione', 'prezzoMin', 'prezzoMax', 'comune'];
+        const missingFields = requiredFields.filter(field => headerMap[field] === undefined);
+
+        if (missingFields.length > 0) {
+          const keysMap: { [key: string]: string } = {
+            zona: 'Zona',
+            tipologia: 'Tipologia',
+            statoConservazione: 'Stato_conservazione',
+            prezzoMin: 'Prezzo_min_mq',
+            prezzoMax: 'Prezzo_max_mq',
+            comune: 'Comune'
+          };
+          const missingFormatted = missingFields.map(f => keysMap[f] || f).join(', ');
+          setCsvError(`Formato CSV non valido. Colonne richieste: Zona, Tipologia, Stato_conservazione, Prezzo_min_mq, Prezzo_max_mq, Comune. Campi mancanti: ${missingFormatted}`);
+          return;
+        }
+
+        const parsedRows: CsvRow[] = [];
+
+        for (let i = 1; i < rawLines.length; i++) {
+          const cells = parseLine(rawLines[i]);
+          if (cells.length < requiredFields.length) continue;
+
+          const rawMin = cells[headerMap['prezzoMin']] || '';
+          const rawMax = cells[headerMap['prezzoMax']] || '';
+
+          const parseNumString = (str: string): number => {
+            let s = str.replace(/"/g, '').replace(/'/g, '').trim();
+            if (s.includes(',') && !s.includes('.')) {
+              s = s.replace(',', '.');
+            } else if (s.includes(',') && s.includes('.')) {
+              s = s.replace(/,/g, '');
+            }
+            const n = parseFloat(s);
+            return isNaN(n) ? 0 : n;
+          };
+
+          const prezzoMin = parseNumString(rawMin);
+          const prezzoMax = parseNumString(rawMax);
+          const comune = (cells[headerMap['comune']] || '').trim();
+          const zona = (cells[headerMap['zona']] || '').trim();
+          const tipologia = (cells[headerMap['tipologia']] || '').trim();
+          const statoConservazione = (cells[headerMap['statoConservazione']] || '').trim().toUpperCase();
+
+          if (comune && statoConservazione) {
+            parsedRows.push({
+              comune,
+              zona,
+              tipologia,
+              statoConservazione,
+              prezzoMin,
+              prezzoMax
+            });
+          }
+        }
+
+        if (parsedRows.length === 0) {
+          setCsvError('Errore: Nessuna riga valida trovata nel file CSV.');
+          return;
+        }
+
+        setCsvRows(parsedRows);
+        setCsvFileName(file.name);
+        setCsvSuccessMessage(`Dati CSV caricati con successo! Ora i prezzi sono basati sul file: ${file.name}`);
+        
+        const uniqueComuni = Array.from(new Set(parsedRows.map(r => r.comune)));
+        if (uniqueComuni.length > 0 && (searchTerm === 'Milano Brera' || !searchTerm.trim())) {
+          setSearchTerm(uniqueComuni[0]);
+        }
+      } catch (err) {
+        setCsvError('Errore durante il parsing del file CSV. Assicurati che sia ben formato.');
+      }
+    };
+    reader.onerror = () => {
+      setCsvError('Impossibile leggere il file.');
+    };
+    reader.readAsText(file);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      handleCsvFileUpload(e.dataTransfer.files[0]);
+    }
+  };
+
+  // Recalculate estimates when CSV data is updated or removed
+  useEffect(() => {
+    if (searchTerm.trim()) {
+      const res = originalCalculatePricesForZone(
+        searchTerm, 
+        selectedCondition, 
+        selectedSize, 
+        selectedFloor, 
+        selectedExposure, 
+        accessories, 
+        selectedTaglio, 
+        csvRows
+      );
+      setSearchResult(res);
+    }
+  }, [csvRows]);
   const [accessories, setAccessories] = useState<AccessoriesInput>({
     hasBalcone: false,
     balconeSize: 0,
@@ -251,6 +449,7 @@ export default function App() {
           </p>
         </section>
 
+
         <section className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
           
           {/* LEFT: Search Controls Panel */}
@@ -310,7 +509,24 @@ export default function App() {
 
             {/* Parameter Selector: Property Condition (Stato di conservazione) */}
             <div className="space-y-1">
-              <label htmlFor="price-finder-condition-select" className="text-[10px] uppercase font-bold text-slate-500 ml-1">Stato Conservazione</label>
+              <div className="flex items-center justify-between ml-1">
+                <label htmlFor="price-finder-condition-select" className="text-[10px] uppercase font-bold text-slate-500">Stato Conservazione</label>
+                <div className="relative group/tooltip">
+                  <span className="text-[10px] text-indigo-600 font-extrabold underline cursor-pointer flex items-center gap-1 hover:text-indigo-800 transition">
+                    <HelpCircle className="w-3.5 h-3.5 text-indigo-500" />
+                    Mappa OMI
+                  </span>
+                  <div className="absolute right-0 bottom-full mb-1.5 hidden group-hover/tooltip:block w-72 p-3 bg-slate-900 border border-slate-800 text-white text-xs rounded-lg shadow-xl z-50 space-y-2 leading-relaxed">
+                    <p className="font-bold text-slate-300 border-b border-slate-800 pb-1 text-[10px] uppercase tracking-wider">Mappatura Categorie OMI</p>
+                    <p className="text-[10px] text-slate-400">Gli stati impostati nel configuratore corrispondono ad indici OMI reali:</p>
+                    <ul className="space-y-1 text-[11px]">
+                      <li className="flex items-center gap-2"><div className="w-1.5 h-1.5 rounded-full bg-emerald-500"></div><div><strong className="text-emerald-300">OTTIMO</strong> &rarr; &quot;Nuovo&quot; o &quot;Ristrutturato&quot;</div></li>
+                      <li className="flex items-center gap-2"><div className="w-1.5 h-1.5 rounded-full bg-amber-500"></div><div><strong className="text-amber-300">NORMALE</strong> &rarr; &quot;Buono&quot; o &quot;Recente&quot;</div></li>
+                      <li className="flex items-center gap-2"><div className="w-1.5 h-1.5 rounded-full bg-rose-500"></div><div><strong className="text-rose-300">DA RISTRUTTURARE</strong> &rarr; &quot;Da ristrutturare&quot;</div></li>
+                    </ul>
+                  </div>
+                </div>
+              </div>
               
               <div className="relative">
                 <select
@@ -731,6 +947,217 @@ export default function App() {
               </p>
             </div>
           </div>
+        </section>
+
+        {/* CSV Upload Section (moved to bottom) */}
+        <section className="bg-white rounded-xl p-6 border border-slate-200 shadow-sm max-w-4xl mx-auto space-y-6 animate-fadeIn" id="csv-upload-section">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 border-b border-slate-100 pb-3">
+            <div>
+              <h3 className="font-extrabold text-slate-800 text-sm flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-indigo-600" />
+                Integrazione Dati OMI Personalizzati
+              </h3>
+              <p className="text-xs text-slate-500">
+                Carica il tuo listino delle quotazioni OMI per aggiornare istantaneamente tutte le stime e i grafici del portale.
+              </p>
+            </div>
+            
+            {csvRows && (
+              <button
+                id="reset-csv-data-button"
+                type="button"
+                onClick={() => {
+                  setCsvRows(null);
+                  setCsvFileName('');
+                  setCsvSuccessMessage('');
+                  setCsvError('');
+                }}
+                className="h-8 px-3.5 text-white font-bold text-xs uppercase tracking-wider rounded-md shadow-sm transition hover:opacity-90 flex items-center gap-1.5 cursor-pointer"
+                style={{ backgroundColor: '#6c757d' }}
+              >
+                Ripristina dati dimostrativi
+              </button>
+            )}
+          </div>
+
+          {/* Status Indicators */}
+          {csvError && (
+            <div className="p-3 bg-red-50 border border-red-200 text-red-805 text-xs rounded-md font-medium">
+              ⚠️ {csvError}
+            </div>
+          )}
+
+          {csvSuccessMessage && (
+            <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-md font-semibold animate-quickFadeIn">
+              ✅ {csvSuccessMessage}
+            </div>
+          )}
+
+          {!csvRows && (
+            <div className="p-3 bg-amber-50 border border-amber-200 text-amber-850 text-xs rounded-md flex items-center gap-2 font-medium">
+              <Info className="w-4 h-4 text-amber-600 shrink-0" />
+              <span>Utilizzo dati dimostrativi di default. Carica un file CSV per applicare quotazioni territoriali reali.</span>
+            </div>
+          )}
+
+          {/* Drag and Drop Zone Area */}
+          <div
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            className={`border-2 border-dashed rounded-lg p-5 text-center flex flex-col items-center justify-center gap-3 transition-all ${
+              isDragging
+                ? 'border-blue-500 bg-blue-50/20 scale-[1.01]'
+                : csvRows
+                ? 'border-emerald-350 bg-emerald-50/5'
+                : 'border-slate-300 hover:border-blue-400 hover:bg-slate-50/30'
+            }`}
+          >
+            <input
+              id="csv-file-input-raw"
+              type="file"
+              accept=".csv"
+              className="hidden"
+              onChange={(e) => {
+                if (e.target.files && e.target.files.length > 0) {
+                  handleCsvFileUpload(e.target.files[0]);
+                }
+              }}
+            />
+            
+            <div className="flex flex-col items-center justify-center gap-3 py-2 w-full">
+              {/* Cloud with Upward Arrow Icon SVG */}
+              <div className="w-12 h-12 rounded-full flex items-center justify-center text-white shadow-sm" style={{ backgroundColor: '#007bff' }}>
+                <svg xmlns="http://www.w3.org/2000/svg" className="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242" />
+                  <path d="M12 12v9" />
+                  <path d="m16 16-4-4-4 4" />
+                </svg>
+              </div>
+
+              {csvRows ? (
+                <div className="space-y-1">
+                  <span className="text-xs font-bold text-slate-800 block">Dati OMI attivi dal file: <strong className="text-emerald-600 font-mono text-sm">{csvFileName}</strong></span>
+                  <p className="text-[11px] text-slate-500">
+                    Trascina o clicca sul pulsante sottostante per sostituire o aggiornare il foglio CSV corrente
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-1">
+                  <span className="text-xs font-bold text-slate-800 block">
+                    Carica o trascina il tuo listino OMI personalizzato
+                  </span>
+                  <p className="text-[11px] text-slate-505">
+                    Il file deve includere colonne: <strong className="text-slate-700">Comune, Zona, Tipologia, Stato_conservazione, Prezzo_min_mq, Prezzo_max_mq</strong>
+                  </p>
+                </div>
+              )}
+
+              <label
+                htmlFor="csv-file-input-raw"
+                className="h-9 px-4 text-white font-bold text-xs uppercase tracking-wider rounded-md shadow-sm transition hover:opacity-90 flex items-center justify-center gap-1.5 cursor-pointer"
+                style={{ backgroundColor: '#007bff' }}
+              >
+                {/* Small cloud icon inside key action button */}
+                <svg xmlns="http://www.w3.org/2000/svg" className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242" />
+                  <path d="M12 12v9" />
+                  <path d="m15 15-3-3-3 3" />
+                </svg>
+                Carica File CSV
+              </label>
+            </div>
+          </div>
+
+          {/* Conditional Preview Section: Shown ONLY after loading a CSV file */}
+          {csvRows ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-1">
+              {/* Column 1: Active Integration Status */}
+              <div className="bg-slate-50 border border-slate-150 p-4 rounded-lg text-xs space-y-15">
+                <span className="font-extrabold text-slate-700 text-[10px] uppercase tracking-wider block">Integrazione OMI Attiva</span>
+                <p className="text-slate-500 text-[11px] leading-relaxed">
+                  Le stime del portale, i range minimi e massimi e i grafici comparativi degli operatori sono elaborati in tempo reale utilizzando il dataset personalizzato.
+                </p>
+                <div className="text-[10px] text-slate-400 pt-1">
+                  Totale record corretti indicizzati: <strong className="text-slate-800">{csvRows.length}</strong>
+                </div>
+              </div>
+
+              {/* Column 2: First 3 rows Dynamic Preview */}
+              <div className="bg-slate-50 border border-slate-150 p-4 rounded-lg text-xs flex flex-col justify-between">
+                <div className="space-y-2 col-span-1">
+                  <span className="font-extrabold text-slate-700 text-[10px] uppercase tracking-wider block mb-1">Dati Caricati (Anteprima Prime 3 Righe)</span>
+                  <div className="overflow-x-auto text-[11px]">
+                    <table className="w-full text-left border-collapse text-[10px] font-medium text-slate-650">
+                      <thead>
+                        <tr className="border-b border-slate-200 text-slate-400 uppercase text-[9px] tracking-wider">
+                          <th className="py-1 pr-2">Comune</th>
+                          <th className="py-1 pr-2">Zona</th>
+                          <th className="py-1 pr-2">OMI Stato</th>
+                          <th className="py-1 text-right">Prezzi Min/Max</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100 font-mono text-[10px]">
+                        {csvRows.slice(0, 3).map((row, idx) => (
+                          <tr key={idx}>
+                            <td className="py-1.5 pr-2 truncate max-w-[85px] font-semibold" title={row.comune}>{row.comune}</td>
+                            <td className="py-1.5 pr-2 truncate max-w-[85px]" title={row.zona}>{row.zona || 'Tutto il territorio'}</td>
+                            <td className="py-1.5 pr-2"><span className="px-1 py-0.5 rounded text-[8.5px] font-bold bg-slate-255 text-slate-700">{row.statoConservazione}</span></td>
+                            <td className="py-1.5 text-right text-slate-850 font-bold">€{row.prezzoMin}-€{row.prezzoMax}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {csvRows.length > 3 && (
+                      <span className="text-[9px] text-slate-450 mt-2 block italic text-right">...e altri {csvRows.length - 3} record trovati nel listino.</span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="bg-slate-50 border border-slate-150 p-4 rounded-lg text-xs space-y-1 text-center">
+              <span className="font-bold text-slate-400 text-[10px] uppercase tracking-wider block">Convalida ed anteprima righe CSV</span>
+              <p className="text-slate-400 text-[11px] max-w-md mx-auto">
+                Carica un listino OMI personalizzato per visualizzare qui l'estratto delle prime tre righe elaborate.
+              </p>
+            </div>
+          )}
+
+          {/* Note a piè di pagina about OMI Mapping */}
+          <div className="bg-slate-50 border border-slate-200/80 p-4 rounded-lg space-y-2">
+            <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wide flex items-center gap-1.5">
+              <Info className="w-4 h-4 text-indigo-650" />
+              Mappatura Categorie di Stato ed Indici Conservativi OMI
+            </h4>
+            <p className="text-xs text-slate-500 leading-normal">
+              Ciascuno stato manutentivo configurato dal pannello di sinistra viene tradotto biunivocamente negli standard dei listini rilasciati dall'Osservatorio del Mercato Immobiliare italiano (OMI):
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
+              <div className="bg-white px-3 py-2 rounded border border-slate-100 flex flex-col justify-center">
+                <div className="flex items-center gap-2">
+                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
+                  <span className="text-xs font-bold text-slate-700">OTTIMO</span>
+                </div>
+                <p className="text-[11px] text-slate-450 mt-1">Mappa indicizzata per: &quot;Nuovo&quot; o &quot;Ristrutturato&quot;</p>
+              </div>
+              <div className="bg-white px-3 py-2 rounded border border-slate-100 flex flex-col justify-center">
+                <div className="flex items-center gap-2">
+                  <span className="w-2.5 h-2.5 rounded-full bg-amber-500"></span>
+                  <span className="text-xs font-bold text-slate-700">NORMALE</span>
+                </div>
+                <p className="text-[11px] text-slate-450 mt-1">Mappa indicizzata per: &quot;Buono&quot; o &quot;Recente&quot;</p>
+              </div>
+              <div className="bg-white px-3 py-2 rounded border border-slate-100 flex flex-col justify-center">
+                <div className="flex items-center gap-2">
+                  <span className="w-2.5 h-2.5 rounded-full bg-red-500"></span>
+                  <span className="text-xs font-bold text-slate-700">DA RISTRUTTURARE</span>
+                </div>
+                <p className="text-[11px] text-slate-450 mt-1">Mappa indicizzata per: &quot;Da ristrutturare&quot;</p>
+              </div>
+            </div>
+          </div>
+
         </section>
 
       </main>

@@ -84,3 +84,12 @@ export interface SearchResult {
   commercialSize?: number;
   estimates: MarketEstimate[]; // All conditions for comparison
 }
+
+export interface CsvRow {
+  comune: string;
+  zona: string;
+  tipologia: string;
+  statoConservazione: string;
+  prezzoMin: number;
+  prezzoMax: number;
+}

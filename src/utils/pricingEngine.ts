@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { PropertyCondition, ConditionDetails, ZoneData, MarketEstimate, SearchResult, FloorOption, ExposureOption, FloorDetails, ExposureDetails, AccessoriesInput, PropertyTaglio } from '../types';
+import { PropertyCondition, ConditionDetails, ZoneData, MarketEstimate, SearchResult, FloorOption, ExposureOption, FloorDetails, ExposureDetails, AccessoriesInput, PropertyTaglio, CsvRow } from '../types';
 
 export const FLOORS: Record<FloorOption, FloorDetails> = {
   'terra': { id: 'terra', label: 'Piano Terra (-15%)', multiplier: 0.85 },
@@ -132,7 +132,7 @@ export const PRESETS_ZONES: ZoneData[] = [
 
 /**
  * Intelligent parser that identifies the search term and estimates real estate prices.
- * It searches the local preset database first, and fallbacks to automated generic calculations.
+ * It searches the live loaded CSV first (if provided), then the local preset database, and fallbacks to automated generic calculations.
  */
 export function calculatePricesForZone(
   input: string,
@@ -141,10 +141,76 @@ export function calculatePricesForZone(
   selectedFloor: FloorOption = 'intermedio',
   selectedExposure: ExposureOption = 'esterna',
   accessories?: AccessoriesInput,
-  selectedTaglio?: PropertyTaglio
+  selectedTaglio?: PropertyTaglio,
+  csvRows?: CsvRow[] | null
 ): SearchResult {
   const normalizedInput = input.trim().toLowerCase();
   
+  if (!normalizedInput && !csvRows) {
+    // Return empty / default fallback
+    return returnFallbackSearchResult('Milano Centro', selectedCondition, sizeSqM, selectedFloor, selectedExposure, accessories, selectedTaglio);
+  }
+
+  // 0. Live CSV Search if available
+  if (csvRows && csvRows.length > 0) {
+    // Extract unique list of Comuni from csvRows
+    const csvComuni = Array.from(new Set(csvRows.map(r => r.comune).filter(Boolean)));
+    
+    // Find the best matching Comune in the CSV
+    let matchedComune = '';
+    
+    // First try: exact match or checker where input contains Comune (e.g. input "Milano Brera" contains "Milano")
+    const foundComune = csvComuni.find(c => normalizedInput.includes(c.toLowerCase()));
+    if (foundComune) {
+      matchedComune = foundComune;
+    } else {
+      // Second try: input is contained in Comune (e.g. input "milan" matches "Milano")
+      const foundComune2 = csvComuni.find(c => c.toLowerCase().includes(normalizedInput));
+      if (foundComune2) {
+        matchedComune = foundComune2;
+      }
+    }
+
+    if (matchedComune) {
+      // Find rows for this Comune
+      let matchingRows = csvRows.filter(r => r.comune.toLowerCase() === matchedComune.toLowerCase());
+      
+      // Let's check if there's a specific Zona in the search input to narrow down our query
+      const uniqZones = Array.from(new Set(matchingRows.map(r => r.zona).filter(Boolean)));
+      const foundZone = uniqZones.find(z => {
+        const zl = z.toLowerCase();
+        return normalizedInput.includes(zl) || zl.includes(normalizedInput);
+      });
+      
+      let matchedZoneName = '';
+      if (foundZone) {
+        const zoneRows = matchingRows.filter(r => r.zona.toLowerCase() === foundZone.toLowerCase());
+        if (zoneRows.length > 0) {
+          matchingRows = zoneRows;
+          matchedZoneName = foundZone;
+        }
+      }
+
+      // Generate base price boundaries from actual matching CSV rows
+      const baseMinRows = matchingRows.filter(r => getOmiStateForCondition('nuovo') === r.statoConservazione.toUpperCase());
+      const baseMaxRows = matchingRows.filter(r => getOmiStateForCondition('nuovo') === r.statoConservazione.toUpperCase());
+      
+      let basePriceMin = baseMinRows.length > 0 ? average(baseMinRows.map(r => r.prezzoMin)) : 2000;
+      let basePriceMax = baseMaxRows.length > 0 ? average(baseMaxRows.map(r => r.prezzoMax)) : 3500;
+
+      const matchedZone: ZoneData = {
+        name: matchedZoneName || 'Tutto il territorio',
+        city: matchedComune,
+        tier: 'province', // will be overridden in the CSV result generator
+        basePriceMin,
+        basePriceMax,
+        description: `Stima reale OMI basata sui record caricati dal file CSV per ${matchedComune}${matchedZoneName ? ' (Zona: ' + matchedZoneName + ')' : ''}.`
+      };
+
+      return generateResultFromZoneCsv(matchedZone, selectedCondition, sizeSqM, selectedFloor, selectedExposure, accessories, selectedTaglio, matchingRows);
+    }
+  }
+
   if (!normalizedInput) {
     // Return empty / default fallback
     return returnFallbackSearchResult('Milano Centro', selectedCondition, sizeSqM, selectedFloor, selectedExposure, accessories, selectedTaglio);
@@ -476,4 +542,164 @@ function returnFallbackSearchResult(
     basePriceMax: 12000,
     description: 'Impostazione predefinita del capoluogo lombardo.'
   }, selectedCondition, sizeSqM, selectedFloor, selectedExposure, accessories, selectedTaglio);
+}
+
+export function generateResultFromZoneCsv(
+  zone: ZoneData,
+  selectedCondition: PropertyCondition,
+  sizeSqM: number,
+  selectedFloor: FloorOption = 'intermedio',
+  selectedExposure: ExposureOption = 'esterna',
+  accessories: AccessoriesInput | undefined,
+  selectedTaglio: PropertyTaglio | undefined,
+  matchingRows: CsvRow[]
+): SearchResult {
+  const floorMult = FLOORS[selectedFloor]?.multiplier ?? 1.0;
+  const exposureMult = EXPOSURES[selectedExposure]?.multiplier ?? 1.0;
+  const combinedMult = floorMult * exposureMult;
+
+  const defaultAccessories: AccessoriesInput = {
+    hasBalcone: false,
+    balconeSize: 0,
+    hasTerrazzo: false,
+    terrazzoSize: 0,
+    hasBox: false,
+    hasBoxDoppio: false,
+    hasPostoCoperto: false,
+    hasPostoScoperto: false,
+    hasCantina: false,
+    cantinaSize: 0,
+    hasSoffitta: false,
+    soffittaSize: 0,
+    hasGiardino: false,
+    giardinoSize: 0
+  };
+
+  const acc = accessories || defaultAccessories;
+
+  let giardinoComm = 0;
+  if (acc.hasGiardino && acc.giardinoSize) {
+    const gSize = Number(acc.giardinoSize);
+    if (gSize <= 100) {
+      giardinoComm = gSize * 0.10;
+    } else {
+      giardinoComm = (100 * 0.10) + ((gSize - 100) * 0.025);
+    }
+  }
+
+  const commercialSize = Number(sizeSqM) 
+    + (acc.hasBalcone ? (Number(acc.balconeSize) * 0.30) : 0)
+    + (acc.hasTerrazzo ? (Number(acc.terrazzoSize) * 0.35) : 0)
+    + (acc.hasCantina ? (Number(acc.cantinaSize) * 0.40) : 0)
+    + (acc.hasSoffitta ? (Number(acc.soffittaSize) * 0.40) : 0)
+    + giardinoComm
+    + (acc.hasBox ? 6 : 0)
+    + (acc.hasBoxDoppio ? 12 : 0)
+    + (acc.hasPostoCoperto ? 6 : 0)
+    + (acc.hasPostoScoperto ? 4 : 0);
+
+  const estimates: MarketEstimate[] = Object.keys(CONDITIONS).map((key) => {
+    const condId = key as PropertyCondition;
+    
+    // Get OMI State name: "OTTIMO" | "NORMALE" | "DA RISTRUTTURARE"
+    const omiState = getOmiStateForCondition(condId);
+    
+    // Filter matching rows for this OMI state
+    let stateRows = matchingRows.filter(r => r.statoConservazione.toUpperCase() === omiState);
+    
+    let baseMin = 0;
+    let baseMax = 0;
+
+    if (stateRows.length > 0) {
+      baseMin = average(stateRows.map(r => r.prezzoMin));
+      baseMax = average(stateRows.map(r => r.prezzoMax));
+    } else {
+      // Fallback search in other states if this specific one is not in CSV for this town
+      const allStatesWithRows = ['OTTIMO', 'NORMALE', 'DA RISTRUTTURARE'].filter(state => 
+        matchingRows.some(r => r.statoConservazione.toUpperCase() === state)
+      );
+      
+      if (allStatesWithRows.length > 0) {
+        const sourceState = allStatesWithRows[0];
+        const sourceRows = matchingRows.filter(r => r.statoConservazione.toUpperCase() === sourceState);
+        const sourceMin = average(sourceRows.map(r => r.prezzoMin));
+        const sourceMax = average(sourceRows.map(r => r.prezzoMax));
+        
+        let ratio = 1.0;
+        if (omiState === 'NORMALE') {
+          if (sourceState === 'OTTIMO') ratio = 0.7;
+          else if (sourceState === 'DA RISTRUTTURARE') ratio = 1.5;
+        } else if (omiState === 'DA RISTRUTTURARE') {
+          if (sourceState === 'OTTIMO') ratio = 0.45;
+          else if (sourceState === 'NORMALE') ratio = 0.65;
+        } else { // OTTIMO
+          if (sourceState === 'NORMALE') ratio = 1.4;
+          else if (sourceState === 'DA RISTRUTTURARE') ratio = 2.2;
+        }
+        
+        baseMin = sourceMin * ratio;
+        baseMax = sourceMax * ratio;
+      } else {
+        baseMin = (condId === 'da-ristrutturare' ? 1200 : condId === 'buono' ? 1800 : 2500);
+        baseMax = (condId === 'da-ristrutturare' ? 1800 : condId === 'buono' ? 2800 : 3800);
+      }
+    }
+
+    let minPrice = Math.round((baseMin * combinedMult) / 50) * 50;
+    let maxPrice = Math.round((baseMax * combinedMult) / 50) * 50;
+
+    if (minPrice < 300) minPrice = 300;
+    if (maxPrice < minPrice + 150) maxPrice = minPrice + 200;
+
+    const rawAvgPrice = Math.round((minPrice + maxPrice) / 2);
+    const tecnocasaPrice = Math.round(rawAvgPrice * 0.984 / 10) * 10;
+    const frimmPrice = Math.round(rawAvgPrice * 1.016 / 10) * 10;
+    const operatoriAvg = Math.round((tecnocasaPrice + frimmPrice) / 2);
+    
+    const omiPrice = Math.round(rawAvgPrice * 1.000 / 10) * 10;
+    const omiMinPrice = Math.round(minPrice / 10) * 10;
+    const omiMaxPrice = Math.round(maxPrice / 10) * 10;
+
+    const avgPrice = Math.round((operatoriAvg + omiPrice) / 2);
+    const estimatedTotal = avgPrice * commercialSize;
+
+    return {
+      condition: condId,
+      minPricePerSqM: minPrice,
+      maxPricePerSqM: maxPrice,
+      avgPricePerSqM: avgPrice,
+      estimatedTotal,
+      tecnocasaPrice,
+      frimmPrice,
+      operatoriAvg,
+      omiPrice,
+      omiMinPrice,
+      omiMaxPrice
+    };
+  });
+
+  return {
+    zoneName: zone.name,
+    cityName: zone.city,
+    tierLabel: 'Dati Reali OMI (Da CSV)',
+    selectedCondition,
+    selectedSize: sizeSqM,
+    selectedTaglio,
+    selectedFloor,
+    selectedExposure,
+    accessories: acc,
+    commercialSize: Math.round(commercialSize * 10) / 10,
+    estimates
+  };
+}
+
+function average(arr: number[]): number {
+  if (arr.length === 0) return 0;
+  return arr.reduce((acc, v) => acc + v, 0) / arr.length;
+}
+
+export function getOmiStateForCondition(cond: PropertyCondition): string {
+  if (cond === 'nuovo' || cond === 'ristrutturato') return 'OTTIMO';
+  if (cond === 'buono' || cond === 'recente') return 'NORMALE';
+  return 'DA RISTRUTTURARE';
 }
